@@ -24,9 +24,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s: %(name)s: %(levelna
 from utils import cos_np, normalize,cos_np_for_normalized
 from configs import get_config
 from models import JointEmbeddingModel
+from parsePython import CodeVisitor
 
 class CodeSearcher:
     def __init__(self, conf=None):
+        self.cv = CodeVisitor()
+        self.py_path = "./data/pydata/"
+
+        self.py_codebase = self.load_pickle(self.py_path + "python_qid_to_code.pickle")
+        #self.py_desc = self.load_pickle(self.py_path + "python_qid_to_title.pickle")
+
+        self.py_use_rawcode = self.py_path + "use_rawcode.pkl"
+        self.py_use_token = self.py_path + "use_token.pkl"
+        self.py_use_methname = self.py_path + "use_methname.pkl"
+        self.py_use_apiseq = self.py_path + "use_apiseq.pkl"
+
         self.conf = dict() if conf is None else conf
         self.path = self.conf.get('workdir', '../data/github/codesearch/')
         self.train_params = conf.get('training_params', dict())
@@ -74,6 +86,7 @@ class CodeSearcher:
         logger.info('Loading use data..')
         logger.info('methname')
         methnames=self.load_hdf5(self.path+self.data_params['use_methname'],0,-1)
+        #print(methnames)
         logger.info('apiseq')
         apiseqs=self.load_hdf5(self.path+self.data_params['use_apiseq'],0,-1)
         logger.info('tokens')
@@ -157,8 +170,6 @@ class CodeSearcher:
         from keras.preprocessing.sequence import pad_sequences
         return pad_sequences(data, maxlen=len, padding='post', truncating='post', value=0)
     
-       
-       
     ##### Model Loading / saving #####
     def save_model_epoch(self, model, epoch):
         if not os.path.exists(self.path+'models/'+self.model_params['model_name']+'/'):
@@ -176,8 +187,6 @@ class CodeSearcher:
         model.load("{}models/{}/epo{:d}_code.h5".format(self.path, self.model_params['model_name'], epoch),
                    "{}models/{}/epo{:d}_desc.h5".format(self.path, self.model_params['model_name'], epoch))
 
-
-
     ##### Training #####
     def train(self, model):
         if self.train_params['reload']>0:
@@ -190,6 +199,7 @@ class CodeSearcher:
         
         val_loss = {'loss': 1., 'epoch': 0}
 
+        logger.info("To run " + str(nb_epoch) + " times.")
         for i in range(self.train_params['reload']+1, nb_epoch):
             print('Epoch %d :: \n' % i, end='')            
             logger.debug('loading data chunk..')
@@ -364,17 +374,16 @@ class CodeSearcher:
         vecs=vecs.astype('float32')
         self.save_code_reprs(vecs)
         return vecs
-            
-    
+
     def search(self,model,query,n_results=10):
         desc=[self.convert(self.vocab_desc,query)]#convert desc sentence to word indices
         padded_desc = self.pad(desc, self.data_params['desc_len'])
         desc_repr=model.repr_desc([padded_desc])
         desc_repr=desc_repr.astype('float32')
-        
         codes=[]
         sims=[]
         threads=[]
+
         for i,code_reprs_chunk in enumerate(self._code_reprs):
             t = threading.Thread(target=self.search_thread, args = (codes,sims,desc_repr,code_reprs_chunk,i,n_results))
             threads.append(t)
@@ -391,18 +400,136 @@ class CodeSearcher:
     #2. choose top results
         negsims=np.negative(chunk_sims[0])
         maxinds = np.argpartition(negsims, kth=n_results-1)
-        maxinds = maxinds[:n_results]        
+        maxinds = maxinds[:n_results]
         chunk_codes=[self._code_base[i][k] for k in maxinds]
         chunk_sims=chunk_sims[0][maxinds]
         codes.extend(chunk_codes)
         sims.extend(chunk_sims)
 
-    
+    """
+    Python Data
+    """
+    def load_python_codebase(self):
+        """load codebase
+        codefile: h5 file that stores raw code
+        """
+        logger.info('Loading codebase (chunk size={})..'.format(self._code_base_chunksize))
+        if self._code_base==None:
+            codebase=[]
+            codes=self.load_pickle(self.py_use_rawcode)
+                #use codecs to read in case of encoding problem
+            codebase.append(codes)
+            self._code_base=codebase
+
+    def load_use_python_data(self):
+        logger.info('Loading use data..')
+        logger.info('methname')
+        methnames=self.load_pickle(self.py_use_methname)
+        #print(methnames)
+        logger.info('apiseq')
+        apiseqs=self.load_pickle(self.py_use_apiseq)
+        logger.info('tokens')
+        tokens=self.load_pickle(self.py_use_token) 
+        return methnames,apiseqs,tokens 
+        
+    def repr_python_code(self, model):
+        methnames,apiseqs,tokens=self.load_use_python_data()
+        padded_methnames = self.pad(methnames, self.data_params['methname_len'])
+        padded_apiseqs = self.pad(apiseqs, self.data_params['apiseq_len'])
+        padded_tokens = self.pad(tokens, self.data_params['tokens_len'])
+        
+        vecs=model.repr_code([padded_methnames,padded_apiseqs,padded_tokens],batch_size=1000)
+        vecs=vecs.astype('float32')
+        self.save_code_reprs(vecs)
+        return vecs
+
+    def preprocess(self, model):
+        cv = self.cv
+        #py_desc = self.py_desc
+        py_codebase = self.py_codebase
+
+        raw_code = open(self.py_use_rawcode,"wb")
+        code_list = []
+        """
+        index = 2490334
+        code = py_codebase.get(2490334)
+        token = cv.getToken(code)
+        token_vec = self.convert(self.vocab_tokens,token)
+        """
+
+        keys = self.py_codebase.keys()
+        token_list = []
+        methname_list = []
+        apiseq_list = []
+
+        """
+        index = 2490334
+        code = py_codebase.get(index)
+        print(code)
+        cv.printAST(code)
+        methodname = cv.getMethodName(code)
+        apiSequence = cv.getAPISequence(code)
+        token = cv.getToken(code)
+
+        token_vec = self.convert(self.vocab_tokens,token)
+        methodname_vec = self.convert(self.vocab_methname,methodname)
+        apiSequence_vec = self.convert(self.vocab_apiseq,apiSequence)
+
+        print(methodname_vec)
+        print(apiSequence_vec)
+        print(token_vec)
+        """
+        print("==================================================================================================")
+        print("Embedding...")
+        #"""
+        for key in keys:
+            code = py_codebase.get(key)
+            #desc = py_desc.get(key)
+            #print(code)
+            try:
+                token = cv.getToken(code)
+                methodname = cv.getMethodName(code)
+                apiSequence = cv.getAPISequence(code)
+
+            except:
+                #print("Error")
+                continue
+            else:
+                token_vec = self.convert(self.vocab_tokens,token)
+                methodname_vec = self.convert(self.vocab_methname,methodname)
+                apiSequence_vec = self.convert(self.vocab_apiseq,apiSequence)
+                
+                token_list.append(token_vec)
+                methname_list.append(methodname_vec)
+                apiseq_list.append(apiSequence_vec)
+                code_list.append(code)
+
+                #desc_vec = self.convert(self.vocab_desc,desc)
+        #"""
+        pickle.dump(code_list,raw_code)
+        raw_code.close()
+
+        print("Embedding completed.")
+        print("Saving...")
+
+        token_output = open(self.py_use_token,'wb')
+        pickle.dump(token_list, token_output)
+        token_output.close()
+
+        methname_output = open(self.py_use_methname,'wb')
+        pickle.dump(methname_list, methname_output)
+        methname_output.close()
+
+        apiseq_output = open(self.py_use_apiseq,'wb')
+        pickle.dump(apiseq_list, apiseq_output)
+        apiseq_output.close()
+        print("Saved.")
+        
 def parse_args():
     parser = argparse.ArgumentParser("Train and Test Code Search(Embedding) Model")
     parser.add_argument("--proto", choices=["get_config"],  default="get_config",
                         help="Prototype config to use for config")
-    parser.add_argument("--mode", choices=["train","eval","repr_code","search"], default='train',
+    parser.add_argument("--mode", choices=["train","eval","repr_code","search","repr_python_code","preprocess", "search_python"], default='train',
                         help="The mode to run. The `train` mode trains a model;"
                         " the `eval` mode evaluat models in a test set "
                         " The `repr_code/repr_desc` mode computes vectors"
@@ -445,6 +572,28 @@ if __name__ == '__main__':
             codesearcher.load_model_epoch(model, conf['training_params']['reload'])
         codesearcher.load_code_reprs()
         codesearcher.load_codebase()
+        while True:
+            try:
+                query = input('Input Query: ')
+                n_results = int(input('How many results? '))
+            except Exception:
+                print("Exception while parsing your input:")
+                traceback.print_exc()
+                break
+            codes,sims=codesearcher.search(model, query,n_results)
+            zipped=zip(codes,sims)
+            results = '\n\n'.join(map(str,zipped)) #combine the result into a returning string
+            print(results)
+    elif args.mode=='repr_python_code':
+        codesearcher.repr_python_code(model)
+    elif args.mode=='preprocess':
+        codesearcher.preprocess(model)
+    elif args.mode=='search_python':
+        #search code based on a desc
+        if conf['training_params']['reload']>0:
+            codesearcher.load_model_epoch(model, conf['training_params']['reload'])
+        codesearcher.load_code_reprs()
+        codesearcher.load_python_codebase()
         while True:
             try:
                 query = input('Input Query: ')
