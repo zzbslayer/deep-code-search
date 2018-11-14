@@ -38,7 +38,7 @@ class CodeSearcher:
     def __init__(self, conf=None):
         self.cv = CodeVisitor()
         self.py_path = "./data/pydata/"
-        self.transfer_path = "./data/transfer"
+        self.transfer_path = "./data/transfer/"
 
         self.py_codebase = self.load_pickle(self.py_path + "python_qid_to_code.pickle")
         #self.py_desc = self.load_pickle(self.py_path + "python_qid_to_title.pickle")
