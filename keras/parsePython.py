@@ -85,15 +85,15 @@ class CodeVisitor(ast.NodeVisitor):
                         else:
                             className = self.classInstance.get(instanceName, "")
 
-                        methodName = ""
+                        apiName = ""
                         for i in message:
                             if (i =="'"):
                                 break
-                            methodName += i
+                            apiName += i
                         if (className == ""):
-                            self.apiSequence.append(methodName)
+                            self.apiSequence.append(apiName)
                         else:
-                            self.apiSequence.append(className + "." + methodName)
+                            self.apiSequence.append(className + "." + apiName)
                         
                     #print(message[10:])
                     #self.apiSequence.append(api)

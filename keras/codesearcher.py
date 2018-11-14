@@ -26,18 +26,31 @@ from configs import get_config
 from models import JointEmbeddingModel
 from parsePython import CodeVisitor
 
+def nan_and_inf(a):
+    where_are_nan = np.isnan(a)
+    where_are_inf = np.isinf(a)
+    a[where_are_nan] = 0
+    a[where_are_inf] = 0
+    return a
+
+
 class CodeSearcher:
     def __init__(self, conf=None):
         self.cv = CodeVisitor()
         self.py_path = "./data/pydata/"
+        self.transfer_path = "./data/transfer"
 
         self.py_codebase = self.load_pickle(self.py_path + "python_qid_to_code.pickle")
         #self.py_desc = self.load_pickle(self.py_path + "python_qid_to_title.pickle")
-
+        self.py_use_codevec = self.py_path + "use_codevecs.h5"
         self.py_use_rawcode = self.py_path + "use_rawcode.pkl"
         self.py_use_token = self.py_path + "use_token.pkl"
         self.py_use_methname = self.py_path + "use_methname.pkl"
         self.py_use_apiseq = self.py_path + "use_apiseq.pkl"
+        self._pycode_reprs=None
+
+        self.transfer_Xs_new = self.transfer_path + "transfer_Xs_new.h5"
+        self.transfer_Xt_new = self.transfer_path + "transfer_Xt_new.h5"
 
         self.conf = dict() if conf is None else conf
         self.path = self.conf.get('workdir', '../data/github/codesearch/')
@@ -119,9 +132,9 @@ class CodeSearcher:
             self._code_reprs=codereprs
         return self._code_reprs
         
-    def save_code_reprs(self,vecs):
+    def save_code_reprs(self,vecs,filename):
         npvecs=np.array(vecs)
-        fvec = tables.open_file(self.path+self.data_params['use_codevecs'], 'w')
+        fvec = tables.open_file(filename, 'w')
         atom = tables.Atom.from_dtype(npvecs.dtype)
         filters = tables.Filters(complib='blosc', complevel=5)
         ds = fvec.create_carray(fvec.root, 'vecs', atom, npvecs.shape,filters=filters)
@@ -152,8 +165,7 @@ class CodeSearcher:
             sents.append(data[pos:pos + len].astype('int32'))
         table.close()
         return sents 
-    
-    
+
     ##### Converting / reverting #####
     def convert(self, vocab, words):
         """convert words into indices"""        
@@ -372,7 +384,7 @@ class CodeSearcher:
         
         vecs=model.repr_code([padded_methnames,padded_apiseqs,padded_tokens],batch_size=1000)
         vecs=vecs.astype('float32')
-        self.save_code_reprs(vecs)
+        self.save_code_reprs(vecs, self.path+self.data_params['use_codevecs'])
         return vecs
 
     def search(self,model,query,n_results=10):
@@ -407,11 +419,12 @@ class CodeSearcher:
         sims.extend(chunk_sims)
 
     """
+    ==================================================================
     Python Data
     """
     def load_python_codebase(self):
         """load codebase
-        codefile: h5 file that stores raw code
+        codefile: pickle that stores raw code
         """
         logger.info('Loading codebase (chunk size={})..'.format(self._code_base_chunksize))
         if self._code_base==None:
@@ -431,6 +444,19 @@ class CodeSearcher:
         logger.info('tokens')
         tokens=self.load_pickle(self.py_use_token) 
         return methnames,apiseqs,tokens 
+    
+    def load_pycode_reprs(self):
+        logger.debug('Loading code vectors (chunk size={})..'.format(self._code_base_chunksize))
+        if self._pycode_reprs==None:            
+            """reads vectors (2D numpy array) from a hdf5 file"""
+            codereprs=[]
+            h5f = tables.open_file(self.py_use_codevec)
+            vecs= h5f.root.vecs
+            for i in range(0,len(vecs),self._code_base_chunksize):
+                codereprs.append(vecs[i:i+self._code_base_chunksize])
+            h5f.close()
+            self._pycode_reprs=codereprs
+        return self._pycode_reprs
         
     def repr_python_code(self, model):
         methnames,apiseqs,tokens=self.load_use_python_data()
@@ -440,7 +466,7 @@ class CodeSearcher:
         
         vecs=model.repr_code([padded_methnames,padded_apiseqs,padded_tokens],batch_size=1000)
         vecs=vecs.astype('float32')
-        self.save_code_reprs(vecs)
+        self.save_code_reprs(vecs, self.py_use_codevec)
         return vecs
 
     def preprocess(self, model):
@@ -524,12 +550,64 @@ class CodeSearcher:
         pickle.dump(apiseq_list, apiseq_output)
         apiseq_output.close()
         print("Saved.")
-        
+
+    '''
+    =======================================
+    Transfer
+    '''  
+    def transfer(self, method="TCA"):
+        Xs = []
+        Xt = []
+        print("Transfering Source Data ...")
+        methnames, apiseqs, tokens = self.load_use_data()
+        py_methnames, py_apiseqs, py_tokens = self.load_use_python_data()
+
+        # Because the array is too large
+        # If we don't cut it, there'll be memory error
+        py_methnames = py_methnames[0:5000]
+        py_apiseqs = py_apiseqs[0:5000]
+        py_tokens = py_tokens[0:5000]
+
+        padded_methnames = self.pad(methnames, self.data_params['methname_len'])
+        padded_apiseqs = self.pad(apiseqs, 10)
+        padded_tokens = self.pad(tokens, 30)
+
+        padded_py_methnames = self.pad(py_methnames, self.data_params['methname_len'])
+        padded_py_apiseqs = self.pad(py_apiseqs, 10)
+        padded_py_tokens = self.pad(py_tokens, 30)
+
+        for i in range(len(padded_methnames)):
+            temp = np.append(padded_methnames[i], padded_apiseqs[i])
+            temp = np.append(temp, padded_tokens[i])
+            Xs.append(temp)
+
+        for j in range(len(padded_py_methnames)):
+            temp = np.append(padded_py_methnames[j], padded_py_apiseqs[j])
+            temp = np.append(temp, padded_py_tokens[j])
+            Xt.append(temp)
+
+        Xs = np.array(Xs)
+        Xt = np.array(Xt)
+        Xs = nan_and_inf(Xs)
+        Xt = nan_and_inf(Xt)
+        Xs_new = []
+        Xt_new = []
+        if method == "TCA":
+            from TCA import TCA
+            tca = TCA(Xs, Xt, dim=self.data_params['methname_len'] +10 + 30)
+            Xs_new, Xt_new = tca.fit()
+        else:
+            print("Unknown Transfer")
+            return
+        print("Transfer Completed")
+        self.save_code_reprs(Xs_new, self.transfer_Xs_new)
+        self.save_code_reprs(Xt_new, self.transfer_Xt_new)
+
 def parse_args():
     parser = argparse.ArgumentParser("Train and Test Code Search(Embedding) Model")
     parser.add_argument("--proto", choices=["get_config"],  default="get_config",
                         help="Prototype config to use for config")
-    parser.add_argument("--mode", choices=["train","eval","repr_code","search","repr_python_code","preprocess", "search_python"], default='train',
+    parser.add_argument("--mode", choices=["train","eval","repr_code","search","repr_python_code","preprocess", "search_python", "transfer"], default='train',
                         help="The mode to run. The `train` mode trains a model;"
                         " the `eval` mode evaluat models in a test set "
                         " The `repr_code/repr_desc` mode computes vectors"
@@ -550,7 +628,7 @@ if __name__ == '__main__':
     optimizer = conf.get('training_params', dict()).get('optimizer', 'adam')
     model.compile(optimizer=optimizer)
     
-    if args.mode=='train':  
+    if args.mode=='train':
         codesearcher.train(model)
         
     elif args.mode=='eval':
@@ -584,10 +662,10 @@ if __name__ == '__main__':
             zipped=zip(codes,sims)
             results = '\n\n'.join(map(str,zipped)) #combine the result into a returning string
             print(results)
-    elif args.mode=='repr_python_code':
-        codesearcher.repr_python_code(model)
     elif args.mode=='preprocess':
         codesearcher.preprocess(model)
+    elif args.mode=='repr_python_code':
+        codesearcher.repr_python_code(model)
     elif args.mode=='search_python':
         #search code based on a desc
         if conf['training_params']['reload']>0:
@@ -606,3 +684,5 @@ if __name__ == '__main__':
             zipped=zip(codes,sims)
             results = '\n\n'.join(map(str,zipped)) #combine the result into a returning string
             print(results)
+    elif args.mode=='transfer':
+        codesearcher.transfer("TCA")
