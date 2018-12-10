@@ -1,12 +1,17 @@
 import ast
 
+def append(li, item):
+    if item in li:
+        return
+    li.append(item)
+
 class CodeVisitor(ast.NodeVisitor): 
 
     def __init__(self):
         self.methodName = []
         self.nodeType = ""
         self.apiSequence = []
-
+        self.tokens = []
         self.classInstance = {}
 
         self.classLevel = -1
@@ -29,6 +34,7 @@ class CodeVisitor(ast.NodeVisitor):
         self.methodName = []
         self.nodeType = ""
         self.apiSequence = []
+        self.tokens = []
         self.classInstance = {}
         self.classLevel = -1
         self.tempClass = ""
@@ -44,11 +50,23 @@ class CodeVisitor(ast.NodeVisitor):
             fields = [(name, self.str_node(val, level)) for name, val in ast.iter_fields(node) if name not in ('left', 'right')]
             rv = '%s(%s' % (className, ', '.join('%s=%s' % field for field in fields))
 
+            '''
+            if (self.nodeType == "Type"):
+                if ( className == "FunctionDef"):
+                    s = fields[1][1]
+                    if (s[16] == ']'):
+                        numOfType = 1
+                    else:
+                        numOfType = s.count(',') - 3
+                    for i in range(numOfType):
+                        self.tokens.append("whatever")
+            '''
             if (self.nodeType == "FunctionDef"):
                 if ( className == self.nodeType):
                     fname = fields[0][1]
                     fname = fname[1:-1] # convert "'function'" to "function"
-                    self.methodName.append(fname)
+                    
+                    append(self.methodName, fname)
             elif (self.nodeType == "Statement"):
                 if (className == "Expr"):
                     #print("##########")
@@ -104,18 +122,15 @@ class CodeVisitor(ast.NodeVisitor):
                     #print(fields)
                     #print(fields[1][1])
                     className = ""
-                    if (assignInfo[0] == 'D'):
-                        className = "Dict"
-                    elif (assignInfo[0] == 'L'):
-                        className = "List"
-                    elif (assignInfo[0] == 'C' or assignInfo[0] == 'S'):
+                    if (assignInfo[0] == 'C' or assignInfo[0] == 'S'):
                         assignInfo = assignInfo[assignInfo.find("id"):]
                         for char in assignInfo[4:]:
                             if (char !="'"):
                                 className += char
                             else:
                                 break
-                    self.apiSequence.append(className + ".new")
+                    if className:
+                        self.apiSequence.append(className)
                     self.tempClass = className
                 elif (className == "Name" and self.tempClass != ""): 
                     #print(fields)
@@ -176,11 +191,20 @@ class CodeVisitor(ast.NodeVisitor):
 
     def getToken(self, code):
         tree = ast.parse(code)
+        '''
+        self.clear()
+        self.nodeType = "Type"
+        self.ast_visit(tree)
+        '''
         array = sorted({node.id for node in ast.walk(tree) if isinstance(node, ast.Name)})
-        result = []
+        temp = []
         for i in array:
-            result += camelSplit(i)
-        return result
+            temp += camelSplit(i)
+        temp = sorted(set(temp),key=temp.index)
+        for i in temp:
+            if len(i) > 1:
+                self.tokens.append(i)
+        return self.tokens
 
 def camelSplit(word):
     result = []
@@ -189,8 +213,11 @@ def camelSplit(word):
         if (i.isupper()):
             result.append(temp.lower())
             temp = i
-        else:
+        elif (i.isdigit() or i.isalpha()):
             temp += i
+        else:
+            if temp != None:
+                result.append(temp.lower())
     result.append(temp.lower())
     return result
 
@@ -198,13 +225,11 @@ if __name__ == '__main__':
     #code = "def add(arg1, arg2):\n\tprint(arg1)\n\treturn arg1+arg2\nadd(1,2)\n"
     cv = CodeVisitor()
     #code2 = "class SomeClass:\n\tdef printFirst():\n\t\tprint(\"x\")\n\tdef printSecond():\n\t\tself.printFirst()\nsomeInstance=SomeClass()\nsomeInstance.printSecond()\n"
-    code2 = "def encode(key, string):\n\ttest={}\n\tencoded_chars = []\n\tfor i in xrange(string):\n\t\tkey_c = key[i % len(key)]\n\t\tencoded_c = chr(ord(string[i]) + ord(key_c) % 256)\n\t\tencoded_chars.append(encoded_c)\n\tencoded_string = \"\".join(encoded_chars)\n\treturn base64.urlsafe_b64encode(encoded_string)"
-    cv.printAST(code2)
-    #token = cv.getToken(code2)
-    #methodname = cv.getMethodName(code2)
-    APISequence = cv.getAPISequence(code2)
+    code2 = "def toGreyScale():\n\treturn RGBColor(0.30*getRed() + 0.59*getGreen() + 0.11*getBlue())"
+    token = cv.getToken(code2)
+    #APISequence = cv.getAPISequence(code2)
     
-    #print(token)
+    print(token)
     #print(methodname)
-    print(APISequence)
+    #print(APISequence)
     #code3="import posixpath\nimport os.path\n\n_os_alt_seps = list(sep for sep in [os.path.sep, os.path.altsep]\n                    if sep not in (None, '/'))\n\ndef safe_join(directory, filename):\n    # docstring omitted for brevity\n    filename = posixpath.normpath(filename)\n    for sep in _os_alt_seps:\n        if sep in filename:\n            raise NotFound()\n    if os.path.isabs(filename) or \\\n       filename == '..' or \\\n       filename.startswith('../'):\n        raise NotFound()\n    return os.path.join(directory, filename)\n"

@@ -55,15 +55,19 @@ class TCA:
         self.lamb = lamb
         self.gamma = gamma
 
+    def normalization(self, X):
+        from sklearn import preprocessing
+        return preprocessing.scale(X)
+
     def fit(self):
         '''
         Transform Xs and Xt
         :return: Xs_new and Xt_new after TCA
         '''
-        print(self.Xs)
-        print(self.Xt)
+
         X = np.hstack((self.Xs.T, self.Xt.T))
-        X = np.dot(X, np.diag(1 / (np.sum(X ** 2, axis=0) ** 0.5)))
+        X = self.normalization(X)
+        #X = np.dot(X, np.diag(1 / (np.sum(X ** 2, axis=0) ** 0.5))) # normalization
         m, n = X.shape
         ns, nt = len(self.Xs), len(self.Xt)
         e = np.vstack((1 / ns * np.ones((ns, 1)), -1 / nt * np.ones((nt, 1))))
@@ -77,7 +81,8 @@ class TCA:
         ind = np.argsort(w)
         A = V[:, ind[:self.dim]]
         Z = np.dot(A.T, K)
-        Z = np.dot(Z, np.diag(1 / (np.sum(Z ** 2, axis=0) ** 0.5)))
+        Z = self.normalization(Z)
+        #Z = np.dot(Z, np.diag(1 / (np.sum(Z ** 2, axis=0) ** 0.5))) # normalization
         Xs_new, Xt_new = Z[:, :ns].T, Z[:, ns:].T
         return Xs_new, Xt_new
 

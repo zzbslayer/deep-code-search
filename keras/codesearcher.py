@@ -26,13 +26,10 @@ from configs import get_config
 from models import JointEmbeddingModel
 from parsePython import CodeVisitor
 
-def nan_and_inf(a):
-    where_are_nan = np.isnan(a)
-    where_are_inf = np.isinf(a)
-    a[where_are_nan] = 0
-    a[where_are_inf] = 0
-    return a
-
+from tables import *
+class Index(IsDescription):
+    pos = UInt64Col()
+    length = UInt16Col()
 
 class CodeSearcher:
     def __init__(self, conf=None):
@@ -47,10 +44,18 @@ class CodeSearcher:
         self.py_use_token = self.py_path + "use_token.pkl"
         self.py_use_methname = self.py_path + "use_methname.pkl"
         self.py_use_apiseq = self.py_path + "use_apiseq.pkl"
-        self._pycode_reprs=None
+
+        self.py_transferred_use_codevec = self.transfer_path + "py_transferred_use_codevec.h5"
 
         self.transfer_Xs_new = self.transfer_path + "transfer_Xs_new.h5"
         self.transfer_Xt_new = self.transfer_path + "transfer_Xt_new.h5"
+        self.source_transferred_methnames = self.transfer_path + "source_transferred_methnames.h5"
+        self.source_transferred_apiseqs = self.transfer_path + "source_transferred_apiseqs.h5"
+        self.source_transferred_tokens = self.transfer_path + "source_transferred_tokens.h5"
+
+        self.target_transferred_methnames = self.transfer_path + "target_transferred_methnames.h5"
+        self.target_transferred_apiseqs = self.transfer_path + "target_transferred_apiseqs.h5"
+        self.target_transferred_tokens = self.transfer_path + "target_transferred_tokens.h5"
 
         self.conf = dict() if conf is None else conf
         self.path = self.conf.get('workdir', '../data/github/codesearch/')
@@ -70,9 +75,31 @@ class CodeSearcher:
         self._code_base_chunksize=2000000
         
     def load_pickle(self, filename):
-        return pickle.load(open(filename, 'rb'))    
+        f = open(filename, 'rb')
+        data = pickle.load(f)
+        f.close()
+        return data   
 
     ##### Data Set #####
+    def load_pickle_data_chunk(self, filename, offset=0, chunk_size=-1):
+        data = self.load_pickle(filename)
+        size = len(data)
+        if chunk_size < 0 or offset + chunk_size > size:
+            return data
+        return data[offset:offset+chunk_size]
+
+    def load_transferred_training_chunk(self, offset, chunk_size):
+        logger.debug('Loading a chunk of training data..')
+        logger.debug('methname')
+        chunk_methnames=self.load_hdf5(self.transferred_methnames,offset,chunk_size)
+        logger.debug('apiseq')
+        chunk_apiseqs=self.load_hdf5(self.transferred_apiseqs,offset,chunk_size)
+        logger.debug('tokens')
+        chunk_tokens=self.load_hdf5(self.transferred_tokens,offset,chunk_size)
+        logger.debug('desc')
+        chunk_descs=self.load_hdf5(self.path+self.data_params['train_desc'],offset,chunk_size)   
+        return chunk_methnames,chunk_apiseqs,chunk_tokens,chunk_descs 
+
     def load_training_data_chunk(self,offset,chunk_size):
         logger.debug('Loading a chunk of training data..')
         logger.debug('methname')
@@ -121,15 +148,14 @@ class CodeSearcher:
     ### Results Data ###
     def load_code_reprs(self):
         logger.debug('Loading code vectors (chunk size={})..'.format(self._code_base_chunksize))
-        if self._code_reprs==None:            
-            """reads vectors (2D numpy array) from a hdf5 file"""
-            codereprs=[]
-            h5f = tables.open_file(self.path+self.data_params['use_codevecs'])
-            vecs= h5f.root.vecs
-            for i in range(0,len(vecs),self._code_base_chunksize):
-                codereprs.append(vecs[i:i+self._code_base_chunksize])
-            h5f.close()
-            self._code_reprs=codereprs
+        """reads vectors (2D numpy array) from a hdf5 file"""
+        codereprs=[]
+        h5f = tables.open_file(self.path+self.data_params['use_codevecs'])
+        vecs= h5f.root.vecs
+        for i in range(0,len(vecs),self._code_base_chunksize):
+            codereprs.append(vecs[i:i+self._code_base_chunksize])
+        h5f.close()
+        self._code_reprs=codereprs
         return self._code_reprs
         
     def save_code_reprs(self,vecs,filename):
@@ -147,6 +173,7 @@ class CodeSearcher:
         table = tables.open_file(vecfile)
         data, index = (table.get_node('/phrases'),table.get_node('/indices'))
         data_len = index.shape[0]
+        
         if chunk_size==-1:#if chunk_size is set to -1, then, load all data
             chunk_size=data_len
         start_offset = start_offset%data_len
@@ -162,7 +189,7 @@ class CodeSearcher:
                 offset=0
             len, pos = index[offset]['length'], index[offset]['pos']
             offset += 1
-            sents.append(data[pos:pos + len].astype('int32'))
+            sents.append(data[pos:pos + len].astype('float32'))
         table.close()
         return sents 
 
@@ -180,7 +207,7 @@ class CodeSearcher:
     ##### Padding #####
     def pad(self, data, len=None):
         from keras.preprocessing.sequence import pad_sequences
-        return pad_sequences(data, maxlen=len, padding='post', truncating='post', value=0)
+        return pad_sequences(data, maxlen=len, dtype="float32", padding='post', truncating='post', value=0)
     
     ##### Model Loading / saving #####
     def save_model_epoch(self, model, epoch):
@@ -200,7 +227,10 @@ class CodeSearcher:
                    "{}models/{}/epo{:d}_desc.h5".format(self.path, self.model_params['model_name'], epoch))
 
     ##### Training #####
-    def train(self, model):
+    '''
+    There shouldn't be any negative number in input_x
+    '''
+    def train(self, model, transfer=False):
         if self.train_params['reload']>0:
             self.load_model_epoch(model, self.train_params['reload'])
         valid_every = self.train_params.get('valid_every', None)
@@ -213,9 +243,15 @@ class CodeSearcher:
 
         logger.info("To run " + str(nb_epoch) + " times.")
         for i in range(self.train_params['reload']+1, nb_epoch):
-            print('Epoch %d :: \n' % i, end='')            
+            print('Epoch %d :: \n' % i, end='')  
+            chunk_methnames,chunk_apiseqs,chunk_tokens,chunk_descs = [],[],[],[]          
             logger.debug('loading data chunk..')
-            chunk_methnames,chunk_apiseqs,chunk_tokens,chunk_descs =\
+            if transfer:
+                chunk_methnames,chunk_apiseqs,chunk_tokens, chunk_descs = self.load_transferred_training_chunk(\
+                                        (i-1)*self.train_params.get('chunk_size', 100000),\
+                                        self.train_params.get('chunk_size', 100000))
+            else:
+                chunk_methnames,chunk_apiseqs,chunk_tokens,chunk_descs =\
                     self.load_training_data_chunk(\
                                         (i-1)*self.train_params.get('chunk_size', 100000),\
                                         self.train_params.get('chunk_size', 100000))
@@ -227,8 +263,10 @@ class CodeSearcher:
             chunk_bad_descs=[desc for desc in chunk_descs]
             random.shuffle(chunk_bad_descs)
             chunk_padded_bad_descs = self.pad(chunk_bad_descs, self.data_params['desc_len'])
-
-            hist = model.fit([chunk_padded_methnames,chunk_padded_apiseqs,chunk_padded_tokens, chunk_padded_good_descs, chunk_padded_bad_descs], epochs=1, batch_size=batch_size, validation_split=split)
+            input_x = [chunk_padded_methnames,chunk_padded_apiseqs,chunk_padded_tokens, chunk_padded_good_descs, chunk_padded_bad_descs]
+            #print(input_x)
+            #return
+            hist = model.fit(input_x, epochs=1, batch_size=batch_size, validation_split=split)
 
             if hist.history['val_loss'][0] < val_loss['loss']:
                 val_loss = {'loss': hist.history['val_loss'][0], 'epoch': i}
@@ -434,18 +472,17 @@ class CodeSearcher:
             codebase.append(codes)
             self._code_base=codebase
 
-    def load_use_python_data(self):
+    def load_use_transferred_python_data(self):
         logger.info('Loading use data..')
         logger.info('methname')
-        methnames=self.load_pickle(self.py_use_methname)
-        #print(methnames)
+        methnames=self.load_hdf5(self.target_transferred_methnames,0,-1)
         logger.info('apiseq')
-        apiseqs=self.load_pickle(self.py_use_apiseq)
+        apiseqs=self.load_hdf5(self.target_transferred_apiseqs,0,-1)
         logger.info('tokens')
-        tokens=self.load_pickle(self.py_use_token) 
-        return methnames,apiseqs,tokens 
-    
-    def load_pycode_reprs(self):
+        tokens=self.load_hdf5(self.target_transferred_tokens,0,-1) 
+        return methnames,apiseqs,tokens  
+
+    def load_transferred_pycode_reprs(self):
         logger.debug('Loading code vectors (chunk size={})..'.format(self._code_base_chunksize))
         if self._pycode_reprs==None:            
             """reads vectors (2D numpy array) from a hdf5 file"""
@@ -457,6 +494,30 @@ class CodeSearcher:
             h5f.close()
             self._pycode_reprs=codereprs
         return self._pycode_reprs
+
+    def load_use_python_data(self):
+        logger.info('Loading use python data..')
+        logger.info('python methname')
+        methnames=self.load_pickle(self.py_use_methname)
+        #print(methnames)
+        logger.info('python apiseq')
+        apiseqs=self.load_pickle(self.py_use_apiseq)
+        logger.info('python tokens')
+        tokens=self.load_pickle(self.py_use_token) 
+        return methnames,apiseqs,tokens 
+    
+    def load_pycode_reprs(self):
+        logger.debug('Loading python code vectors (chunk size={})..'.format(self._code_base_chunksize))
+        if self._code_reprs==None:            
+            """reads vectors (2D numpy array) from a hdf5 file"""
+            codereprs=[]
+            h5f = tables.open_file(self.py_use_codevec)
+            vecs= h5f.root.vecs
+            for i in range(0,len(vecs),self._code_base_chunksize):
+                codereprs.append(vecs[i:i+self._code_base_chunksize])
+            h5f.close()
+            self._code_reprs=codereprs
+        return self._code_reprs
         
     def repr_python_code(self, model):
         methnames,apiseqs,tokens=self.load_use_python_data()
@@ -467,6 +528,30 @@ class CodeSearcher:
         vecs=model.repr_code([padded_methnames,padded_apiseqs,padded_tokens],batch_size=1000)
         vecs=vecs.astype('float32')
         self.save_code_reprs(vecs, self.py_use_codevec)
+        return vecs
+
+    def load_transferred_pycode_reprs(self):
+        logger.debug('Loading transferred python code vectors (chunk size={})..'.format(self._code_base_chunksize))
+        if self._code_reprs==None:            
+            """reads vectors (2D numpy array) from a hdf5 file"""
+            codereprs=[]
+            h5f = tables.open_file(self.py_transferred_use_codevec)
+            vecs= h5f.root.vecs
+            for i in range(0,len(vecs),self._code_base_chunksize):
+                codereprs.append(vecs[i:i+self._code_base_chunksize])
+            h5f.close()
+            self._code_reprs=codereprs
+        return self._code_reprs
+
+    def repr_transferred_python_code(self, model):
+        methnames,apiseqs,tokens=self.load_use_transferred_python_data()
+        padded_methnames = self.pad(methnames, self.data_params['methname_len'])
+        padded_apiseqs = self.pad(apiseqs, self.data_params['apiseq_len'])
+        padded_tokens = self.pad(tokens, self.data_params['tokens_len'])
+        
+        vecs=model.repr_code([padded_methnames,padded_apiseqs,padded_tokens],batch_size=1000)
+        vecs=vecs.astype('float32')
+        self.save_code_reprs(vecs, self.py_transferred_use_codevec)
         return vecs
 
     def preprocess(self, model):
@@ -538,24 +623,22 @@ class CodeSearcher:
         print("Embedding completed.")
         print("Saving...")
 
-        token_output = open(self.py_use_token,'wb')
-        pickle.dump(token_list, token_output)
-        token_output.close()
+        self.save_pkl(token_list, self.py_use_token)
+        self.save_pkl(methname_list, self.py_use_methname)
+        self.save_pkl(apiseq_list, self.py_use_apiseq)
 
-        methname_output = open(self.py_use_methname,'wb')
-        pickle.dump(methname_list, methname_output)
-        methname_output.close()
-
-        apiseq_output = open(self.py_use_apiseq,'wb')
-        pickle.dump(apiseq_list, apiseq_output)
-        apiseq_output.close()
         print("Saved.")
+
+    def save_pkl(self, data, filename):
+        f = open(filename, 'wb')
+        pickle.dump(data, f)
+        f.close()
 
     '''
     =======================================
     Transfer
     '''  
-    def transfer(self, method="TCA"):
+    def transfer(self, method="TCA", source_size=5000, target_size=2000):
         Xs = []
         Xt = []
         print("Transfering Source Data ...")
@@ -564,50 +647,99 @@ class CodeSearcher:
 
         # Because the array is too large
         # If we don't cut it, there'll be memory error
-        py_methnames = py_methnames[0:5000]
-        py_apiseqs = py_apiseqs[0:5000]
-        py_tokens = py_tokens[0:5000]
+        methnames = methnames[0:source_size]
+        apiseqs = apiseqs[0:source_size]
+        tokens = tokens[0:source_size]
+
+        py_methnames = py_methnames[0:target_size]
+        py_apiseqs = py_apiseqs[0:target_size]
+        py_tokens = py_tokens[0:target_size]
 
         padded_methnames = self.pad(methnames, self.data_params['methname_len'])
-        padded_apiseqs = self.pad(apiseqs, 10)
-        padded_tokens = self.pad(tokens, 30)
+        padded_apiseqs = self.pad(apiseqs, self.data_params['apiseq_len'])
+        padded_tokens = self.pad(tokens, self.data_params['tokens_len'])
 
         padded_py_methnames = self.pad(py_methnames, self.data_params['methname_len'])
-        padded_py_apiseqs = self.pad(py_apiseqs, 10)
-        padded_py_tokens = self.pad(py_tokens, 30)
+        padded_py_apiseqs = self.pad(py_apiseqs, self.data_params['apiseq_len'])
+        padded_py_tokens = self.pad(py_tokens, self.data_params['tokens_len'])
 
         for i in range(len(padded_methnames)):
-            temp = np.append(padded_methnames[i], padded_apiseqs[i])
-            temp = np.append(temp, padded_tokens[i])
+            temp = np.concatenate((padded_methnames[i], padded_apiseqs[i], padded_tokens[i]), axis=0)
             Xs.append(temp)
 
         for j in range(len(padded_py_methnames)):
-            temp = np.append(padded_py_methnames[j], padded_py_apiseqs[j])
-            temp = np.append(temp, padded_py_tokens[j])
+            temp = np.concatenate((padded_py_methnames[j], padded_py_apiseqs[j], padded_py_tokens[j]), axis=0)
             Xt.append(temp)
 
         Xs = np.array(Xs)
         Xt = np.array(Xt)
-        Xs = nan_and_inf(Xs)
-        Xt = nan_and_inf(Xt)
         Xs_new = []
         Xt_new = []
         if method == "TCA":
             from TCA import TCA
-            tca = TCA(Xs, Xt, dim=self.data_params['methname_len'] +10 + 30)
+            tca = TCA(Xs, Xt, dim=self.data_params['methname_len'] + self.data_params['apiseq_len'] +  self.data_params['tokens_len'])
             Xs_new, Xt_new = tca.fit()
+            # Xs_new cannot contain any negative value
+            Xs_new = np.add(Xs_new,10)
+            Xt_new = np.add(Xt_new,10)
         else:
             print("Unknown Transfer")
             return
         print("Transfer Completed")
-        self.save_code_reprs(Xs_new, self.transfer_Xs_new)
+        
+        source_methnames_new = Xs_new[:, 0:self.data_params['methname_len']]
+        source_apiseqs_new = Xs_new[:, self.data_params['methname_len']:self.data_params['apiseq_len']]
+        source_tokens_new = Xs_new[:, self.data_params['apiseq_len']:self.data_params['tokens_len']]
+
+        self.save_h5file(source_methnames_new, self.source_transferred_methnames)
+        self.save_h5file(source_apiseqs_new, self.source_transferred_apiseqs)
+        self.save_h5file(source_tokens_new, self.source_transferred_tokens)
+
+        target_methnames_new = Xs_new[:, 0:self.data_params['methname_len']]
+        target_apiseqs_new = Xs_new[:, self.data_params['methname_len']:self.data_params['apiseq_len']]
+        target_tokens_new = Xs_new[:, self.data_params['apiseq_len']:self.data_params['tokens_len']]
+        
+        self.save_h5file(target_methnames_new, self.target_transferred_methnames)
+        self.save_h5file(target_apiseqs_new, self.target_transferred_apiseqs)
+        self.save_h5file(target_tokens_new, self.target_transferred_tokens)
+
+        #self.save_code_reprs(Xs_new, self.transfer_Xs_new)
         self.save_code_reprs(Xt_new, self.transfer_Xt_new)
+        return Xs_new, Xt_new
+
+    def save_h5file(self, X, filename):
+
+        data = _pack2Dto1D(X)
+
+        h5file = open_file(filename, mode='w', title=filename)
+        h5file.create_array("/", "phrases", data.astype('float32'), "1D Data array")
+        table = h5file.create_table("/", 'indices', Index, 'Index of data')
+        index = table.row
+
+        offset = 0
+        for i in range(len(X)):
+            length = len(X[i])
+            index['pos']= offset
+            index['length'] = length
+            index.append()
+            offset += length
+        table.flush()
+        h5file.close()
+
+    
+    
+
+def _pack2Dto1D(X):
+    R = []
+    for i in X:
+        R = np.concatenate((R,i), axis=0)
+    return R
 
 def parse_args():
     parser = argparse.ArgumentParser("Train and Test Code Search(Embedding) Model")
     parser.add_argument("--proto", choices=["get_config"],  default="get_config",
                         help="Prototype config to use for config")
-    parser.add_argument("--mode", choices=["train","eval","repr_code","search","repr_python_code","preprocess", "search_python", "transfer"], default='train',
+    parser.add_argument("--mode", choices=["train","eval","repr_code","search","repr_python_code","preprocess", "search_python", "transfer", "train_transferred", "repr_transferred_python_code", "search_transferred_python"], default='train',
                         help="The mode to run. The `train` mode trains a model;"
                         " the `eval` mode evaluat models in a test set "
                         " The `repr_code/repr_desc` mode computes vectors"
@@ -670,7 +802,7 @@ if __name__ == '__main__':
         #search code based on a desc
         if conf['training_params']['reload']>0:
             codesearcher.load_model_epoch(model, conf['training_params']['reload'])
-        codesearcher.load_code_reprs()
+        codesearcher.load_pycode_reprs()
         codesearcher.load_python_codebase()
         while True:
             try:
@@ -685,4 +817,27 @@ if __name__ == '__main__':
             results = '\n\n'.join(map(str,zipped)) #combine the result into a returning string
             print(results)
     elif args.mode=='transfer':
-        codesearcher.transfer("TCA")
+        codesearcher.transfer("TCA",10000,5000)
+    elif args.mode=='repr_transferred_python_code':
+        codesearcher.repr_transferred_python_code(model)
+    elif args.mode=='train_transferred':
+        codesearcher.train(model, True)
+    elif args.mode== 'search_transferred_python':
+        #search code based on a desc
+        if conf['training_params']['reload']>0:
+            codesearcher.load_model_epoch(model, conf['training_params']['reload'])
+        codesearcher.load_transferred_pycode_reprs()
+        codesearcher.load_python_codebase()
+        while True:
+            try:
+                query = raw_input('Input Query: ')
+                n_results = int(raw_input('How many results? '))
+            except Exception:
+                print("Exception while parsing your input:")
+                traceback.print_exc()
+                break
+            codes,sims=codesearcher.search(model, query,n_results)
+            zipped=zip(codes,sims)
+            results = '\n\n'.join(map(str,zipped)) #combine the result into a returning string
+            print(results)
+
